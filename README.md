@@ -4,7 +4,7 @@
 ![macOS 14+](https://img.shields.io/badge/macOS-14%2B-000000?logo=apple&logoColor=white)
 ![License: MIT](https://img.shields.io/badge/License-MIT-blue)
 
-A native macOS QuickLook extension for Markdown files. Select a `.md` file in Finder, press Space, and get a rendered preview.
+A macOS QuickLook extension for Markdown files. Select a `.md` file in Finder, press Space, and get a rendered preview.
 
 ![Glance previewing a Markdown file](assets/screenshot.png)
 

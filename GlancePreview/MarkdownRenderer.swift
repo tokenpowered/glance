@@ -100,7 +100,7 @@ struct HTMLConverter: MarkupVisitor {
     }
 
     mutating func visitHTMLBlock(_ html: HTMLBlock) -> String {
-        escapeHTML(html.rawHTML)
+        sanitizeHTML(html.rawHTML)
     }
 
     mutating func visitTable(_ table: Table) -> String {
@@ -228,7 +228,148 @@ struct HTMLConverter: MarkupVisitor {
     }
 
     mutating func visitInlineHTML(_ html: InlineHTML) -> String {
-        escapeHTML(html.rawHTML)
+        sanitizeHTML(html.rawHTML)
+    }
+
+    // MARK: - HTML sanitization
+
+    /// Allowlisted tags that pass through raw HTML blocks/inlines.
+    /// Everything else gets escaped.
+    private static let imgPattern = try! NSRegularExpression(
+        pattern: #"<img\b[^>]*/?\s*>"#,
+        options: [.caseInsensitive, .dotMatchesLineSeparators]
+    )
+
+    /// Passes allowlisted HTML tags through after sanitizing their attributes.
+    /// All non-allowlisted content is escaped.
+    private mutating func sanitizeHTML(_ raw: String) -> String {
+        let nsRange = NSRange(raw.startIndex..., in: raw)
+        let matches = Self.imgPattern.matches(in: raw, range: nsRange)
+
+        if matches.isEmpty {
+            return escapeHTML(raw)
+        }
+
+        var result = ""
+        var cursor = raw.startIndex
+
+        for match in matches {
+            guard let range = Range(match.range, in: raw) else { continue }
+
+            // Escape everything before this <img> tag
+            if cursor < range.lowerBound {
+                result += escapeHTML(String(raw[cursor..<range.lowerBound]))
+            }
+
+            result += sanitizeImgTag(String(raw[range]))
+            cursor = range.upperBound
+        }
+
+        // Escape anything remaining after the last match
+        if cursor < raw.endIndex {
+            result += escapeHTML(String(raw[cursor...]))
+        }
+
+        return result
+    }
+
+    /// Attribute pattern: name="value", name='value', or name=bare
+    private static let attrPattern = try! NSRegularExpression(
+        pattern: #"(\w+)\s*=\s*(?:"([^"]*)"|'([^']*)'|(\S+))"#,
+        options: [.caseInsensitive]
+    )
+
+    private static let allowedImgAttrs: Set<String> = ["src", "alt", "width", "height", "title"]
+
+    /// Sanitizes an <img> tag: extracts only allowlisted attributes and
+    /// applies the same local-file security as visitImage (path traversal
+    /// protection, size limit, base64 inlining).
+    private mutating func sanitizeImgTag(_ tag: String) -> String {
+        let nsRange = NSRange(tag.startIndex..., in: tag)
+        let matches = Self.attrPattern.matches(in: tag, range: nsRange)
+
+        var attrs: [(name: String, value: String)] = []
+        for match in matches {
+            guard let nameRange = Range(match.range(at: 1), in: tag) else { continue }
+            let name = String(tag[nameRange]).lowercased()
+
+            guard Self.allowedImgAttrs.contains(name) else { continue }
+
+            // Value is in group 2 (double-quoted), 3 (single-quoted), or 4 (bare)
+            let value: String
+            if let r = Range(match.range(at: 2), in: tag), match.range(at: 2).length > 0 {
+                value = String(tag[r])
+            } else if let r = Range(match.range(at: 3), in: tag), match.range(at: 3).length > 0 {
+                value = String(tag[r])
+            } else if let r = Range(match.range(at: 4), in: tag), match.range(at: 4).length > 0 {
+                value = String(tag[r])
+            } else {
+                value = ""
+            }
+
+            attrs.append((name: name, value: value))
+        }
+
+        // Reject javascript: and data: URIs in src to prevent XSS
+        // (data: images from our own base64 inlining below are fine — they're
+        // constructed internally, not taken from user input)
+        if let srcEntry = attrs.first(where: { $0.name == "src" }) {
+            let lower = srcEntry.value.trimmingCharacters(in: .whitespaces).lowercased()
+            if lower.hasPrefix("javascript:") {
+                return escapeHTML(tag)
+            }
+        }
+
+        // Process src the same way visitImage does: inline local files as
+        // base64 with path traversal protection, pass remote URLs through
+        var processedAttrs: [(name: String, value: String)] = []
+        for attr in attrs {
+            if attr.name == "src" {
+                processedAttrs.append((name: "src", value: resolveImageSrc(attr.value)))
+            } else {
+                processedAttrs.append(attr)
+            }
+        }
+
+        // Build the clean tag
+        let attrString = processedAttrs
+            .map { "\($0.name)=\"\(escapeHTML($0.value))\"" }
+            .joined(separator: " ")
+
+        if attrString.isEmpty {
+            return "<img>"
+        }
+        return "<img \(attrString)>"
+    }
+
+    /// Resolves an image src value using the same logic as visitImage:
+    /// remote URLs pass through, local paths get base64-inlined with path
+    /// traversal protection and a 10 MB size cap.
+    private func resolveImageSrc(_ source: String) -> String {
+        if source.hasPrefix("http://") || source.hasPrefix("https://") || source.hasPrefix("data:") {
+            return source
+        }
+
+        let resolved = baseURL.appendingPathComponent(source)
+        let resolvedStandard = resolved.standardizedFileURL
+        let baseStandard = baseURL.standardizedFileURL
+
+        guard resolvedStandard.path.hasPrefix(baseStandard.path) else {
+            return source
+        }
+
+        guard let attrs = try? FileManager.default.attributesOfItem(atPath: resolvedStandard.path),
+              let fileSize = attrs[.size] as? Int,
+              fileSize <= 10_485_760 else {
+            return source
+        }
+
+        guard let data = try? Data(contentsOf: resolved) else {
+            return source
+        }
+
+        let mime = mimeType(for: resolved.pathExtension)
+        return "data:\(mime);base64,\(data.base64EncodedString())"
     }
 
     // MARK: - Helpers

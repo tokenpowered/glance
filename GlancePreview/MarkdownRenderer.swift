@@ -13,7 +13,7 @@ enum MarkdownRenderer {
         <meta charset="utf-8">
         <meta name="viewport" content="width=device-width, initial-scale=1">
         <meta name="color-scheme" content="light dark">
-        <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; img-src data: https:;">
+        <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; img-src data: http: https:;">
         <style>
         \(StyleSheet.css)
         </style>
@@ -233,10 +233,10 @@ struct HTMLConverter: MarkupVisitor {
 
     // MARK: - HTML sanitization
 
-    /// Allowlisted tags that pass through raw HTML blocks/inlines.
-    /// Everything else gets escaped.
+    /// Matches <img> tags in raw HTML, correctly handling `>` inside quoted
+    /// attribute values (e.g. alt="a > b").
     private static let imgPattern = try! NSRegularExpression(
-        pattern: #"<img\b[^>]*/?\s*>"#,
+        pattern: #"<img\b(?:[^>"']|"[^"]*"|'[^']*')*>"#,
         options: [.caseInsensitive, .dotMatchesLineSeparators]
     )
 
@@ -273,13 +273,42 @@ struct HTMLConverter: MarkupVisitor {
         return result
     }
 
-    /// Attribute pattern: name="value", name='value', or name=bare
+    /// Attribute pattern: name="value", name='value', or name=bare.
+    /// Bare values stop at whitespace or `>` to avoid capturing the tag close.
     private static let attrPattern = try! NSRegularExpression(
-        pattern: #"(\w+)\s*=\s*(?:"([^"]*)"|'([^']*)'|(\S+))"#,
+        pattern: #"(\w[\w-]*)\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s>]+))"#,
         options: [.caseInsensitive]
     )
 
-    private static let allowedImgAttrs: Set<String> = ["src", "alt", "width", "height", "title"]
+    private static let allowedImgAttrs: Set<String> = [
+        "src", "alt", "width", "height", "title", "style",
+    ]
+
+    /// CSS properties allowed in style attributes. Everything else is stripped.
+    private static let allowedCSSProperties: Set<String> = [
+        "max-width", "max-height", "width", "height",
+        "display", "margin", "margin-top", "margin-right", "margin-bottom", "margin-left",
+        "text-align", "vertical-align",
+        "border", "border-radius", "padding",
+    ]
+
+    /// Sanitizes a CSS style string to only include allowlisted properties.
+    private static func sanitizeStyle(_ style: String) -> String {
+        style
+            .split(separator: ";")
+            .compactMap { declaration -> String? in
+                let parts = declaration.split(separator: ":", maxSplits: 1)
+                guard parts.count == 2 else { return nil }
+                let property = parts[0].trimmingCharacters(in: .whitespaces).lowercased()
+                let value = parts[1].trimmingCharacters(in: .whitespaces)
+                guard allowedCSSProperties.contains(property) else { return nil }
+                // Block url() and expression() in values
+                let lower = value.lowercased()
+                guard !lower.contains("url("), !lower.contains("expression(") else { return nil }
+                return "\(property): \(value)"
+            }
+            .joined(separator: "; ")
+    }
 
     /// Sanitizes an <img> tag: extracts only allowlisted attributes and
     /// applies the same local-file security as visitImage (path traversal
@@ -297,11 +326,11 @@ struct HTMLConverter: MarkupVisitor {
 
             // Value is in group 2 (double-quoted), 3 (single-quoted), or 4 (bare)
             let value: String
-            if let r = Range(match.range(at: 2), in: tag), match.range(at: 2).length > 0 {
+            if let r = Range(match.range(at: 2), in: tag) {
                 value = String(tag[r])
-            } else if let r = Range(match.range(at: 3), in: tag), match.range(at: 3).length > 0 {
+            } else if let r = Range(match.range(at: 3), in: tag) {
                 value = String(tag[r])
-            } else if let r = Range(match.range(at: 4), in: tag), match.range(at: 4).length > 0 {
+            } else if let r = Range(match.range(at: 4), in: tag) {
                 value = String(tag[r])
             } else {
                 value = ""
@@ -310,22 +339,26 @@ struct HTMLConverter: MarkupVisitor {
             attrs.append((name: name, value: value))
         }
 
-        // Reject javascript: and data: URIs in src to prevent XSS
-        // (data: images from our own base64 inlining below are fine — they're
-        // constructed internally, not taken from user input)
+        // Reject dangerous URI schemes in src
         if let srcEntry = attrs.first(where: { $0.name == "src" }) {
             let lower = srcEntry.value.trimmingCharacters(in: .whitespaces).lowercased()
-            if lower.hasPrefix("javascript:") {
+            if lower.hasPrefix("javascript:") || lower.hasPrefix("data:") {
                 return escapeHTML(tag)
             }
         }
 
         // Process src the same way visitImage does: inline local files as
-        // base64 with path traversal protection, pass remote URLs through
+        // base64 with path traversal protection, pass remote URLs through.
+        // Sanitize style values with a CSS property allowlist.
         var processedAttrs: [(name: String, value: String)] = []
         for attr in attrs {
             if attr.name == "src" {
                 processedAttrs.append((name: "src", value: resolveImageSrc(attr.value)))
+            } else if attr.name == "style" {
+                let sanitized = Self.sanitizeStyle(attr.value)
+                if !sanitized.isEmpty {
+                    processedAttrs.append((name: "style", value: sanitized))
+                }
             } else {
                 processedAttrs.append(attr)
             }

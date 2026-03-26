@@ -75,8 +75,8 @@ struct HTMLConverter: MarkupVisitor {
             // but preserve subsequent paragraphs if present
             var inline = content
             if inline.hasPrefix("<p>"), let end = inline.range(of: "</p>") {
-                inline.removeSubrange(inline.startIndex..<inline.index(inline.startIndex, offsetBy: 3))
                 inline.removeSubrange(end)
+                inline.removeSubrange(inline.startIndex..<inline.index(inline.startIndex, offsetBy: 3))
             }
             let trimmed = inline.trimmingCharacters(in: .whitespacesAndNewlines)
             return "<li class=\"task-item\"><input type=\"checkbox\" disabled\(checked)> \(trimmed)</li>\n"
